@@ -6,6 +6,7 @@ use walkdir::WalkDir;
 use regex::Regex;
 use colored::*;
 use serde::{Deserialize, Serialize};
+use quick_xml::se::to_string as to_xml_string;
 
 #[derive(Debug, Clone, Serialize)]
 struct TestIssue {
@@ -71,6 +72,7 @@ enum OutputFormat {
     #[default]
     Console,
     Json,
+    Xml,
 }
 
 #[derive(Debug, Deserialize)]
@@ -633,6 +635,7 @@ impl TestAuditor {
         match self.config.output.format {
             OutputFormat::Console => self.generate_console_report(),
             OutputFormat::Json => self.generate_json_report(),
+            OutputFormat::Xml => self.generate_xml_report(),
         }
     }
 
@@ -705,6 +708,25 @@ impl TestAuditor {
             Err(e) => eprintln!("Error generating JSON report: {}", e),
         }
     }
+
+    fn generate_xml_report(&self) {
+        #[derive(Serialize)]
+        #[serde(rename = "test_audit_report")]
+        struct XmlReport {
+            total_issues: usize,
+            issues: Vec<TestIssue>,
+        }
+
+        let report = XmlReport {
+            total_issues: self.issues.len(),
+            issues: self.issues.clone(),
+        };
+
+        match to_xml_string(&report) {
+            Ok(xml) => println!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml),
+            Err(e) => eprintln!("Error generating XML report: {}", e),
+        }
+    }
 }
 
 fn load_config(config_path: Option<&str>) -> Result<Config, Box<dyn std::error::Error>> {
@@ -754,6 +776,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .action(clap::ArgAction::SetTrue)
         )
         .arg(
+            Arg::new("xml")
+                .short('x')
+                .long("xml")
+                .help("Output in XML format")
+                .action(clap::ArgAction::SetTrue)
+        )
+        .arg(
             Arg::new("no-color")
                 .long("no-color")
                 .help("Disable colored output")
@@ -765,6 +794,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _verbose = matches.get_flag("verbose");
     let config_path = matches.get_one::<String>("config").map(|s| s.as_str());
     let json_output = matches.get_flag("json");
+    let xml_output = matches.get_flag("xml");
     let no_color = matches.get_flag("no-color");
 
     let mut config = load_config(config_path)?;
@@ -772,6 +802,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Override config with CLI arguments
     if json_output {
         config.output.format = OutputFormat::Json;
+    }
+    if xml_output {
+        config.output.format = OutputFormat::Xml;
     }
     if no_color {
         config.output.color = false;
@@ -1037,6 +1070,7 @@ mod tests {
         match auditor.config.output.format {
             OutputFormat::Json => assert!(true),
             OutputFormat::Console => assert!(false, "Expected JSON format"),
+            OutputFormat::Xml => assert!(false, "Expected JSON format"),
         }
     }
 
@@ -1094,6 +1128,7 @@ magic_number_threshold = 50
         match config.output.format {
             OutputFormat::Json => assert!(true),
             OutputFormat::Console => assert!(false, "Expected JSON format"),
+            OutputFormat::Xml => assert!(false, "Expected JSON format"),
         }
     }
 }

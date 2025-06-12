@@ -43,6 +43,7 @@ Audit a specific directory:
 ```bash
 cargo run -- --path tests/
 cargo run -- --path src/
+cargo run -- --path docs/examples/
 ```
 
 ### Command Line Options
@@ -53,6 +54,10 @@ cargo run -- --help
 
 - `-p, --path <PATH>` - Path to the directory to audit (default: current directory)
 - `-v, --verbose` - Enable verbose output
+- `-j, --json` - Output in JSON format
+- `-x, --xml` - Output in XML format
+- `--no-color` - Disable colored output
+- `-c, --config <CONFIG_FILE>` - Path to configuration file
 
 ### Example Output
 
@@ -156,6 +161,32 @@ fn test_with_meaningful_constants() {
 }
 ```
 
+## Output Formats
+
+The auditor supports multiple output formats:
+
+### Console Output (Default)
+Human-readable colored output with issue descriptions and code snippets.
+
+### JSON Output
+Machine-readable JSON format for integration with other tools:
+```bash
+cargo run -- --json
+```
+
+### XML Output
+XML format for systems that prefer XML over JSON:
+```bash
+cargo run -- --xml
+```
+
+## Examples
+
+See the `docs/examples/` directory for:
+- `bad_tests.rs` - Examples of poor testing practices that the auditor detects
+- `good_tests.rs` - Examples of good testing practices to follow
+- `README.md` - Detailed explanations of each pattern
+
 ## Integration with CI/CD
 
 You can integrate the test auditor into your CI pipeline:
@@ -196,6 +227,9 @@ cargo run -- --path src/
 
 # Audit the integration tests (intentionally contains bad patterns for testing)
 cargo run -- --path tests/
+
+# Audit the example files
+cargo run -- --path docs/examples/
 ```
 
 ### Adding New Detection Patterns
@@ -216,7 +250,7 @@ cargo run -- --path tests/
 
 ## License
 
-[Add your license here]
+MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 

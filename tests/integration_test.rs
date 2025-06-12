@@ -207,6 +207,55 @@ mod tests {{
     assert!(json["total_issues"].as_u64().unwrap() > 0);
 }
 
+#[test]
+fn test_xml_output() {
+    let dir = tempdir().unwrap();
+    let test_file = dir.path().join("xml_test.rs");
+    let mut file = fs::File::create(&test_file).unwrap();
+    
+    writeln!(file, r#"
+#[cfg(test)]
+mod tests {{
+    #[test]
+    fn test_always_passes() {{
+        assert!(true);
+    }}
+    
+    #[test]
+    fn test_hardcoded() {{
+        assert_eq!(42, 42);
+    }}
+}}"#).unwrap();
+
+    // Run the auditor with XML output
+    let output = std::process::Command::new("cargo")
+        .args(&["run", "--", "-p", dir.path().to_str().unwrap(), "--xml"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    
+    // Find the XML output part (after the compilation warnings)
+    let xml_part = if let Some(pos) = stderr.find("<?xml") {
+        &stderr[pos..]
+    } else {
+        &stdout
+    };
+    
+    // Verify it contains XML structure
+    assert!(xml_part.contains("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+    assert!(xml_part.contains("<test_audit_report>"));
+    assert!(xml_part.contains("<total_issues>"));
+    assert!(xml_part.contains("<issues>"));
+    assert!(xml_part.contains("<file_path>"));
+    assert!(xml_part.contains("<line_number>"));
+    assert!(xml_part.contains("<issue_type>"));
+    assert!(xml_part.contains("<description>"));
+    assert!(xml_part.contains("<code_snippet>"));
+    assert!(xml_part.contains("</test_audit_report>"));
+}
+
 #[test] 
 fn test_config_file_support() {
     let dir = tempdir().unwrap();
