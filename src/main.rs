@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use regex::Regex;
 use colored::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct TestIssue {
     file_path: PathBuf,
     line_number: usize,
@@ -15,7 +16,124 @@ struct TestIssue {
     code_snippet: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize)]
+struct Config {
+    #[serde(default)]
+    rules: RuleConfig,
+    #[serde(default)]
+    output: OutputConfig,
+    #[serde(default)]
+    patterns: PatternConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleConfig {
+    #[serde(default = "default_true")]
+    hardcoded_values: bool,
+    #[serde(default = "default_true")]
+    always_pass: bool,
+    #[serde(default = "default_true")]
+    empty_test: bool,
+    #[serde(default = "default_true")]
+    error_ignored: bool,
+    #[serde(default = "default_true")]
+    misleading_name: bool,
+    #[serde(default = "default_true")]
+    copy_pasted: bool,
+    #[serde(default = "default_true")]
+    edge_case_not_tested: bool,
+    #[serde(default = "default_true")]
+    implementation_detail: bool,
+    #[serde(default = "default_true")]
+    no_assertions: bool,
+    #[serde(default = "default_true")]
+    non_deterministic: bool,
+    #[serde(default = "default_true")]
+    unsafe_unwrap: bool,
+    #[serde(default = "default_true")]
+    vague_panic: bool,
+    #[serde(default = "default_true")]
+    magic_numbers: bool,
+    #[serde(default = "default_true")]
+    async_test_issue: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutputConfig {
+    #[serde(default)]
+    format: OutputFormat,
+    #[serde(default = "default_true")]
+    color: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+enum OutputFormat {
+    #[default]
+    Console,
+    Json,
+}
+
+#[derive(Debug, Deserialize)]
+struct PatternConfig {
+    #[serde(default = "default_magic_number_threshold")]
+    magic_number_threshold: u32,
+    #[serde(default)]
+    ignore_patterns: Vec<String>,
+}
+
+fn default_true() -> bool { true }
+fn default_magic_number_threshold() -> u32 { 10 }
+
+impl Default for RuleConfig {
+    fn default() -> Self {
+        Self {
+            hardcoded_values: true,
+            always_pass: true,
+            empty_test: true,
+            error_ignored: true,
+            misleading_name: true,
+            copy_pasted: true,
+            edge_case_not_tested: true,
+            implementation_detail: true,
+            no_assertions: true,
+            non_deterministic: true,
+            unsafe_unwrap: true,
+            vague_panic: true,
+            magic_numbers: true,
+            async_test_issue: true,
+        }
+    }
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            format: OutputFormat::Console,
+            color: true,
+        }
+    }
+}
+
+impl Default for PatternConfig {
+    fn default() -> Self {
+        Self {
+            magic_number_threshold: 10,
+            ignore_patterns: Vec::new(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            rules: RuleConfig::default(),
+            output: OutputConfig::default(),
+            patterns: PatternConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 enum IssueType {
     HardcodedValues,
     AlwaysPass,
@@ -30,6 +148,7 @@ enum IssueType {
     UnsafeUnwrap,
     VaguePanic,
     MagicNumbers,
+    AsyncTestIssue,
 }
 
 impl IssueType {
@@ -48,6 +167,7 @@ impl IssueType {
             IssueType::UnsafeUnwrap => "yellow",
             IssueType::VaguePanic => "yellow",
             IssueType::MagicNumbers => "yellow",
+            IssueType::AsyncTestIssue => "red",
         }
     }
 
@@ -66,6 +186,7 @@ impl IssueType {
             IssueType::UnsafeUnwrap => "Unsafe unwrap() without error message",
             IssueType::VaguePanic => "should_panic without specific message",
             IssueType::MagicNumbers => "Magic numbers/strings without context",
+            IssueType::AsyncTestIssue => "Async test without proper .await or runtime",
         }
     }
 }
@@ -74,10 +195,15 @@ struct TestAuditor {
     issues: Vec<TestIssue>,
     test_patterns: Vec<Regex>,
     issue_patterns: Vec<(Regex, IssueType)>,
+    config: Config,
 }
 
 impl TestAuditor {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_config(Config::default())
+    }
+
+    fn with_config(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let test_patterns = vec![
             Regex::new(r"#\[test\]")?,
             Regex::new(r"#\[cfg\(test\)\]")?,
@@ -98,10 +224,10 @@ impl TestAuditor {
             // Empty tests
             (Regex::new(r"#\[test\]\s*fn\s+\w+\(\)\s*\{\s*\}")?, IssueType::EmptyTest),
             
-            // Error ignored
-            (Regex::new(r"\.unwrap_or\(\)")?, IssueType::ErrorIgnored),
+            // Error ignored - more specific patterns
+            (Regex::new(r"\.unwrap_or\(\s*\)")?, IssueType::ErrorIgnored),
             (Regex::new(r"let\s+_\s*=.*\.unwrap\(\)")?, IssueType::ErrorIgnored),
-            (Regex::new(r"catch\s*\{[^}]*\}")?, IssueType::ErrorIgnored),
+            (Regex::new(r"\.unwrap_or_default\(\)\s*;")?, IssueType::ErrorIgnored),
             
             // Implementation details
             (Regex::new(r"assert!\(\w+\.capacity\(\)")?, IssueType::ImplementationDetail),
@@ -111,7 +237,7 @@ impl TestAuditor {
             (Regex::new(r"SystemTime::now\(\)|Instant::now\(\)")?, IssueType::NonDeterministic),
             (Regex::new(r"rand::|random\(\)|thread_rng\(\)")?, IssueType::NonDeterministic),
             
-            // Unsafe unwrap (simple pattern - will refine later)
+            // Unsafe unwrap - simple pattern, context checking done separately
             (Regex::new(r"\.unwrap\(\)")?, IssueType::UnsafeUnwrap),
             
             // Vague should_panic
@@ -120,13 +246,59 @@ impl TestAuditor {
             // Magic numbers in assertions (numbers > 10 without obvious context)
             (Regex::new(r"assert_eq!\([^,]*,\s*\d{2,}\s*\)")?, IssueType::MagicNumbers),
             (Regex::new(r"assert!\([^)]*>\s*\d{2,}\s*\)")?, IssueType::MagicNumbers),
+            
+            // Async test issues
+            (Regex::new(r"async\s+fn\s+test_\w+\(\)")?, IssueType::AsyncTestIssue),
         ];
 
         Ok(TestAuditor {
             issues: Vec::new(),
             test_patterns,
             issue_patterns,
+            config,
         })
+    }
+
+    fn is_rule_enabled(&self, issue_type: &IssueType) -> bool {
+        match issue_type {
+            IssueType::HardcodedValues => self.config.rules.hardcoded_values,
+            IssueType::AlwaysPass => self.config.rules.always_pass,
+            IssueType::EmptyTest => self.config.rules.empty_test,
+            IssueType::ErrorIgnored => self.config.rules.error_ignored,
+            IssueType::MisleadingName => self.config.rules.misleading_name,
+            IssueType::CopyPasted => self.config.rules.copy_pasted,
+            IssueType::EdgeCaseNotTested => self.config.rules.edge_case_not_tested,
+            IssueType::ImplementationDetail => self.config.rules.implementation_detail,
+            IssueType::NoAssertions => self.config.rules.no_assertions,
+            IssueType::NonDeterministic => self.config.rules.non_deterministic,
+            IssueType::UnsafeUnwrap => self.config.rules.unsafe_unwrap,
+            IssueType::VaguePanic => self.config.rules.vague_panic,
+            IssueType::MagicNumbers => self.config.rules.magic_numbers,
+            IssueType::AsyncTestIssue => self.config.rules.async_test_issue,
+        }
+    }
+
+    fn is_safe_unwrap_context(&self, line: &str) -> bool {
+        // Known safe unwrap patterns in tests
+        let safe_patterns = [
+            r"tempdir\(\)\.unwrap\(\)",           // tempfile crate
+            r"File::create\([^)]*\)\.unwrap\(\)", // file creation in tests
+            r"write!\([^)]*\)\.unwrap\(\)",       // writing in tests
+            r"writeln!\([^)]*\)\.unwrap\(\)",     // writing lines in tests
+            r"dir\.path\(\)\.join\([^)]*\)",      // path joining
+            r"Command::new\([^)]*\)\..*\.unwrap\(\)", // test commands
+            r"Vec::new\(\)\..*\.unwrap\(\)",      // vec operations that can't fail
+            r"String::from_utf8\([^)]*\)\.unwrap\(\)", // known valid UTF-8 in tests
+        ];
+
+        for pattern in &safe_patterns {
+            if Regex::new(pattern).map_or(false, |re| re.is_match(line)) {
+                return true;
+            }
+        }
+
+        // Also safe if there's a comment explaining why it's safe
+        line.contains("// safe:") || line.contains("// SAFETY:") || line.contains("// OK to unwrap")
     }
 
     fn is_test_file(&self, path: &Path) -> bool {
@@ -136,8 +308,8 @@ impl TestAuditor {
                 return false;
             }
             let path_str = path.to_str().unwrap_or("");
-            // Exclude target directory, hidden directories, and other build artifacts
-            if path_str.contains("target/") || path_str.contains("/.") {
+            // Exclude target directory and hidden directories, but not temp directories
+            if path_str.contains("target/") || (path_str.contains("/.") && !path_str.contains("/tmp")) {
                 return false;
             }
             return name.contains("test") || name.ends_with("_test.rs") || name == "tests.rs";
@@ -173,13 +345,24 @@ impl TestAuditor {
         self.check_for_copy_pasted_tests(file_path, &lines);
         self.check_for_misleading_names(file_path, &lines);
         self.check_for_no_assertions(file_path, &lines);
+        self.check_async_tests(file_path, &lines);
 
         Ok(())
     }
 
     fn check_line(&mut self, file_path: &Path, line_number: usize, line: &str, full_content: &str) {
+        // Check for ignore comments
+        if line.contains("// auditor:ignore") || line.contains("// test-auditor:ignore") {
+            return;
+        }
+
         for (pattern, issue_type) in &self.issue_patterns {
-            if pattern.is_match(line) {
+            if pattern.is_match(line) && self.is_rule_enabled(issue_type) {
+                // Skip unwrap checks for well-known safe patterns in tests or with comments
+                if *issue_type == IssueType::UnsafeUnwrap && (self.is_safe_unwrap_context(line) || line.contains("//")) {
+                    continue;
+                }
+                
                 self.issues.push(TestIssue {
                     file_path: file_path.to_path_buf(),
                     line_number,
@@ -191,7 +374,7 @@ impl TestAuditor {
         }
         
         // Check for edge cases not tested
-        if line.contains("todo!") && self.test_patterns.iter().any(|p| p.is_match(full_content)) {
+        if line.contains("todo!") && self.test_patterns.iter().any(|p| p.is_match(full_content)) && self.is_rule_enabled(&IssueType::EdgeCaseNotTested) {
             self.issues.push(TestIssue {
                 file_path: file_path.to_path_buf(),
                 line_number,
@@ -203,7 +386,7 @@ impl TestAuditor {
         
         // Check for tautological assert_eq!
         if let Some(captures) = Regex::new(r"assert_eq!\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)").unwrap().captures(line) {
-            if captures.get(1).map(|m| m.as_str()) == captures.get(2).map(|m| m.as_str()) {
+            if captures.get(1).map(|m| m.as_str()) == captures.get(2).map(|m| m.as_str()) && self.is_rule_enabled(&IssueType::AlwaysPass) {
                 self.issues.push(TestIssue {
                     file_path: file_path.to_path_buf(),
                     line_number,
@@ -216,6 +399,9 @@ impl TestAuditor {
     }
 
     fn check_for_copy_pasted_tests(&mut self, file_path: &Path, lines: &[&str]) {
+        if !self.is_rule_enabled(&IssueType::CopyPasted) {
+            return;
+        }
         let mut test_bodies = HashSet::new();
         let mut current_test_body = String::new();
         let mut in_test = false;
@@ -267,6 +453,9 @@ impl TestAuditor {
     }
 
     fn check_for_misleading_names(&mut self, file_path: &Path, lines: &[&str]) {
+        if !self.is_rule_enabled(&IssueType::MisleadingName) {
+            return;
+        }
         let misleading_patterns = vec![
             (Regex::new(r"fn test_\w*success\w*").unwrap(), "panic!"),
             (Regex::new(r"fn test_\w*fail\w*").unwrap(), "assert!"),
@@ -296,6 +485,9 @@ impl TestAuditor {
     }
 
     fn check_for_no_assertions(&mut self, file_path: &Path, lines: &[&str]) {
+        if !self.is_rule_enabled(&IssueType::NoAssertions) {
+            return;
+        }
         let assertion_patterns = vec![
             Regex::new(r"assert!").unwrap(),
             Regex::new(r"assert_eq!").unwrap(),
@@ -356,6 +548,74 @@ impl TestAuditor {
         }
     }
 
+    fn check_async_tests(&mut self, file_path: &Path, lines: &[&str]) {
+        if !self.is_rule_enabled(&IssueType::AsyncTestIssue) {
+            return;
+        }
+
+        let mut in_async_test = false;
+        let mut test_start_line = 0;
+        let mut test_body = String::new();
+        let mut brace_count = 0;
+        let mut seen_opening_brace = false;
+
+        for (line_number, line) in lines.iter().enumerate() {
+            if line.contains("#[test]") && lines.get(line_number + 1).map_or(false, |next_line| next_line.contains("async fn")) {
+                in_async_test = true;
+                test_start_line = line_number + 1;
+                test_body.clear();
+                brace_count = 0;
+                seen_opening_brace = false;
+            } else if in_async_test {
+                // Count braces
+                for ch in line.chars() {
+                    if ch == '{' {
+                        brace_count += 1;
+                        seen_opening_brace = true;
+                    } else if ch == '}' {
+                        brace_count -= 1;
+                    }
+                }
+                
+                // Add to test body if we've seen the opening brace
+                if seen_opening_brace {
+                    test_body.push_str(line);
+                    test_body.push('\n');
+                }
+                
+                // Check if we've closed all braces (end of test)
+                if brace_count == 0 && seen_opening_brace {
+                    // Check for common async test issues
+                    if !test_body.contains(".await") && !test_body.contains("block_on") && !test_body.contains("Runtime::new") {
+                        self.issues.push(TestIssue {
+                            file_path: file_path.to_path_buf(),
+                            line_number: test_start_line,
+                            issue_type: IssueType::AsyncTestIssue,
+                            description: "Async test function without .await, block_on, or runtime setup".to_string(),
+                            code_snippet: "async fn without async operations".to_string(),
+                        });
+                    }
+                    
+                    // Check for missing tokio::test or async-std::test attributes
+                    let prev_lines = &lines[test_start_line.saturating_sub(3)..test_start_line];
+                    let has_async_test_attr = prev_lines.iter().any(|l| l.contains("tokio::test") || l.contains("async_std::test"));
+                    
+                    if !has_async_test_attr && test_body.contains(".await") {
+                        self.issues.push(TestIssue {
+                            file_path: file_path.to_path_buf(),
+                            line_number: test_start_line,
+                            issue_type: IssueType::AsyncTestIssue,
+                            description: "Async test with .await but missing #[tokio::test] or #[async_std::test]".to_string(),
+                            code_snippet: "async test without proper test attribute".to_string(),
+                        });
+                    }
+                    
+                    in_async_test = false;
+                }
+            }
+        }
+    }
+
     fn audit_directory(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let test_files = self.find_test_files(path);
         
@@ -370,7 +630,19 @@ impl TestAuditor {
     }
 
     fn generate_report(&self) {
-        println!("\n{}", "=== TEST AUDIT REPORT ===".bold().blue());
+        match self.config.output.format {
+            OutputFormat::Console => self.generate_console_report(),
+            OutputFormat::Json => self.generate_json_report(),
+        }
+    }
+
+    fn generate_console_report(&self) {
+        let title = if self.config.output.color {
+            "=== TEST AUDIT REPORT ===".bold().blue().to_string()
+        } else {
+            "=== TEST AUDIT REPORT ===".to_string()
+        };
+        println!("\n{}", title);
         println!("Total issues found: {}\n", self.issues.len());
 
         let mut issues_by_type: std::collections::HashMap<IssueType, Vec<&TestIssue>> = std::collections::HashMap::new();
@@ -380,21 +652,70 @@ impl TestAuditor {
         }
 
         for (issue_type, issues) in issues_by_type {
-            println!("{} ({})", issue_type.description().color(issue_type.color()).bold(), issues.len());
+            let type_header = if self.config.output.color {
+                format!("{} ({})", issue_type.description().color(issue_type.color()).bold(), issues.len())
+            } else {
+                format!("{} ({})", issue_type.description(), issues.len())
+            };
+            println!("{}", type_header);
             
             for issue in issues {
                 println!("  📁 {}", issue.file_path.display());
                 println!("  📍 Line {}: {}", issue.line_number, issue.description);
-                println!("  💻 {}", issue.code_snippet.dimmed());
+                let snippet = if self.config.output.color {
+                    issue.code_snippet.dimmed().to_string()
+                } else {
+                    issue.code_snippet.clone()
+                };
+                println!("  💻 {}", snippet);
                 println!();
             }
         }
 
-        if self.issues.is_empty() {
-            println!("{}", "✅ No issues found! Your tests look good.".green().bold());
+        let status_message = if self.issues.is_empty() {
+            if self.config.output.color {
+                "✅ No issues found! Your tests look good.".green().bold().to_string()
+            } else {
+                "✅ No issues found! Your tests look good.".to_string()
+            }
         } else {
-            println!("{}", "❌ Issues found that may need attention.".red().bold());
+            if self.config.output.color {
+                "❌ Issues found that may need attention.".red().bold().to_string()
+            } else {
+                "❌ Issues found that may need attention.".to_string()
+            }
+        };
+        println!("{}", status_message);
+    }
+
+    fn generate_json_report(&self) {
+        #[derive(Serialize)]
+        struct JsonReport {
+            total_issues: usize,
+            issues: Vec<TestIssue>,
         }
+
+        let report = JsonReport {
+            total_issues: self.issues.len(),
+            issues: self.issues.clone(),
+        };
+
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{}", json),
+            Err(e) => eprintln!("Error generating JSON report: {}", e),
+        }
+    }
+}
+
+fn load_config(config_path: Option<&str>) -> Result<Config, Box<dyn std::error::Error>> {
+    let config_file = config_path.unwrap_or(".test-auditor");
+    
+    if Path::new(config_file).exists() {
+        let content = fs::read_to_string(config_file)?;
+        let config: Config = toml::from_str(&content)?;
+        Ok(config)
+    } else {
+        Ok(Config::default())
     }
 }
 
@@ -418,16 +739,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("Enable verbose output")
                 .action(clap::ArgAction::SetTrue)
         )
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("CONFIG_FILE")
+                .help("Path to configuration file")
+        )
+        .arg(
+            Arg::new("json")
+                .short('j')
+                .long("json")
+                .help("Output in JSON format")
+                .action(clap::ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("no-color")
+                .long("no-color")
+                .help("Disable colored output")
+                .action(clap::ArgAction::SetTrue)
+        )
         .get_matches();
 
     let path = matches.get_one::<String>("path").unwrap();
     let _verbose = matches.get_flag("verbose");
+    let config_path = matches.get_one::<String>("config").map(|s| s.as_str());
+    let json_output = matches.get_flag("json");
+    let no_color = matches.get_flag("no-color");
 
-    let mut auditor = TestAuditor::new()?;
+    let mut config = load_config(config_path)?;
+    
+    // Override config with CLI arguments
+    if json_output {
+        config.output.format = OutputFormat::Json;
+    }
+    if no_color {
+        config.output.color = false;
+    }
+
+    let mut auditor = TestAuditor::with_config(config)?;
     auditor.audit_directory(Path::new(path))?;
     auditor.generate_report();
 
-    Ok(())
+    // Exit with proper code for CI
+    let exit_code = if auditor.issues.is_empty() { 0 } else { 1 };
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]
@@ -451,6 +807,7 @@ mod tests {
         assert_eq!(IssueType::UnsafeUnwrap.color(), "yellow");
         assert_eq!(IssueType::VaguePanic.color(), "yellow");
         assert_eq!(IssueType::MagicNumbers.color(), "yellow");
+        assert_eq!(IssueType::AsyncTestIssue.color(), "red");
     }
 
     #[test]
@@ -468,11 +825,12 @@ mod tests {
         assert_eq!(IssueType::UnsafeUnwrap.description(), "Unsafe unwrap() without error message");
         assert_eq!(IssueType::VaguePanic.description(), "should_panic without specific message");
         assert_eq!(IssueType::MagicNumbers.description(), "Magic numbers/strings without context");
+        assert_eq!(IssueType::AsyncTestIssue.description(), "Async test without proper .await or runtime");
     }
 
     #[test]
     fn test_auditor_new() {
-        let auditor = TestAuditor::new().unwrap();
+        let auditor = TestAuditor::with_config(Config::default()).unwrap();
         assert!(auditor.issues.is_empty());
         assert!(!auditor.test_patterns.is_empty());
         assert!(!auditor.issue_patterns.is_empty());
@@ -480,7 +838,7 @@ mod tests {
 
     #[test]
     fn test_is_test_file() {
-        let auditor = TestAuditor::new().unwrap();
+        let auditor = TestAuditor::with_config(Config::default()).unwrap();
         
         assert!(auditor.is_test_file(Path::new("test_module.rs")));
         assert!(auditor.is_test_file(Path::new("module_test.rs")));
@@ -492,7 +850,7 @@ mod tests {
 
     #[test]
     fn test_detect_hardcoded_values() {
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "assert_eq!(42, 42)", "");
@@ -510,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_detect_always_pass() {
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "assert!(true)", "");
@@ -522,7 +880,7 @@ mod tests {
 
     #[test]
     fn test_detect_empty_test() {
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "#[test] fn test_empty() { }", "");
@@ -533,7 +891,7 @@ mod tests {
 
     #[test]
     fn test_detect_error_ignored() {
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "result.unwrap_or()", "");
@@ -548,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_detect_implementation_details() {
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "assert!(vec.capacity() > 10)", "");
@@ -560,7 +918,7 @@ mod tests {
 
     #[test]
     fn test_check_copy_pasted_tests() {
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         let file_path = Path::new("test.rs");
         
         let lines = vec![
@@ -582,7 +940,7 @@ mod tests {
 
     #[test]
     fn test_check_misleading_names() {
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         let file_path = Path::new("test.rs");
         
         let lines = vec![
@@ -611,7 +969,7 @@ mod tests {
         writeln!(file, "    assert!(true);").unwrap();
         writeln!(file, "}}").unwrap();
         
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         auditor.audit_file(&file_path).unwrap();
         
         assert_eq!(auditor.issues.len(), 1);
@@ -627,7 +985,7 @@ mod tests {
         fs::File::create(dir.path().join("main.rs")).unwrap();
         fs::File::create(dir.path().join("lib.rs")).unwrap();
         
-        let auditor = TestAuditor::new().unwrap();
+        let auditor = TestAuditor::with_config(Config::default()).unwrap();
         let test_files = auditor.find_test_files(dir.path());
         
         assert_eq!(test_files.len(), 2);
@@ -637,13 +995,13 @@ mod tests {
 
     #[test]
     fn test_generate_report_no_issues() {
-        let auditor = TestAuditor::new().unwrap();
+        let auditor = TestAuditor::with_config(Config::default()).unwrap();
         auditor.generate_report();
     }
 
     #[test]
     fn test_generate_report_with_issues() {
-        let mut auditor = TestAuditor::new().unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
         
         auditor.issues.push(TestIssue {
             file_path: PathBuf::from("test.rs"),
@@ -654,5 +1012,88 @@ mod tests {
         });
         
         auditor.generate_report();
+    }
+
+    #[test]
+    fn test_config_rule_disabling() {
+        let mut config = Config::default();
+        config.rules.hardcoded_values = false;
+        config.rules.always_pass = true;
+        
+        let auditor = TestAuditor::with_config(config).unwrap();
+        
+        assert!(!auditor.is_rule_enabled(&IssueType::HardcodedValues));
+        assert!(auditor.is_rule_enabled(&IssueType::AlwaysPass));
+    }
+
+    #[test]
+    fn test_json_output_format() {
+        let mut config = Config::default();
+        config.output.format = OutputFormat::Json;
+        
+        let auditor = TestAuditor::with_config(config).unwrap();
+        
+        // This test just verifies the config is set correctly
+        match auditor.config.output.format {
+            OutputFormat::Json => assert!(true),
+            OutputFormat::Console => assert!(false, "Expected JSON format"),
+        }
+    }
+
+    #[test]
+    fn test_safe_unwrap_detection() {
+        let auditor = TestAuditor::with_config(Config::default()).unwrap();
+        
+        // Test safe unwrap patterns
+        assert!(auditor.is_safe_unwrap_context("let dir = tempdir().unwrap();"));
+        assert!(auditor.is_safe_unwrap_context("let file = File::create(path).unwrap();"));
+        assert!(auditor.is_safe_unwrap_context("writeln!(file, \"test\").unwrap();"));
+        assert!(auditor.is_safe_unwrap_context("result.unwrap(); // safe: this is guaranteed to work"));
+        
+        // Test unsafe unwrap patterns
+        assert!(!auditor.is_safe_unwrap_context("let value = some_result.unwrap();"));
+        assert!(!auditor.is_safe_unwrap_context("process_data().unwrap();"));
+    }
+
+    #[test]
+    fn test_load_config_default() {
+        let config = load_config(None).unwrap();
+        
+        // Should return default config when no file exists
+        assert!(config.rules.hardcoded_values);
+        assert!(config.rules.always_pass);
+        assert_eq!(config.patterns.magic_number_threshold, 10);
+    }
+
+    #[test]
+    fn test_config_file_loading() {
+        let dir = tempdir().unwrap();
+        let config_file = dir.path().join(".test-auditor");
+        let mut file = fs::File::create(&config_file).unwrap();
+        
+        writeln!(file, r#"
+[rules]
+hardcoded_values = false
+always_pass = true
+
+[output]
+format = "Json"
+color = false
+
+[patterns]
+magic_number_threshold = 50
+"#).unwrap();
+
+        let config = load_config(Some(config_file.to_str().unwrap())).unwrap();
+        
+        assert!(!config.rules.hardcoded_values);
+        assert!(config.rules.always_pass);
+        assert!(!config.output.color);
+        assert_eq!(config.patterns.magic_number_threshold, 50);
+        
+        match config.output.format {
+            OutputFormat::Json => assert!(true),
+            OutputFormat::Console => assert!(false, "Expected JSON format"),
+        }
     }
 }
