@@ -29,7 +29,7 @@
           openssl
         ];
       in {
-        defaultPackage = pkgs.rustPlatform.buildRustPackage {
+        packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "rust-test-auditor";
           version = "0.1.0";
           
@@ -41,6 +41,11 @@
           
           nativeBuildInputs = nativeBuildInputs;
           buildInputs = buildInputs;
+        };
+        
+        apps.default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/rust-test-auditor";
         };
         
         devShell = pkgs.mkShell {

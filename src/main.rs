@@ -131,6 +131,15 @@ impl TestAuditor {
 
     fn is_test_file(&self, path: &Path) -> bool {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            // Only consider .rs files
+            if !name.ends_with(".rs") {
+                return false;
+            }
+            let path_str = path.to_str().unwrap_or("");
+            // Exclude target directory, hidden directories, and other build artifacts
+            if path_str.contains("target/") || path_str.contains("/.") {
+                return false;
+            }
             return name.contains("test") || name.ends_with("_test.rs") || name == "tests.rs";
         }
         false
@@ -168,7 +177,7 @@ impl TestAuditor {
         Ok(())
     }
 
-    fn check_line(&mut self, file_path: &Path, line_number: usize, line: &str, _full_content: &str) {
+    fn check_line(&mut self, file_path: &Path, line_number: usize, line: &str, full_content: &str) {
         for (pattern, issue_type) in &self.issue_patterns {
             if pattern.is_match(line) {
                 self.issues.push(TestIssue {
@@ -179,6 +188,17 @@ impl TestAuditor {
                     code_snippet: line.trim().to_string(),
                 });
             }
+        }
+        
+        // Check for edge cases not tested
+        if line.contains("todo!") && self.test_patterns.iter().any(|p| p.is_match(full_content)) {
+            self.issues.push(TestIssue {
+                file_path: file_path.to_path_buf(),
+                line_number,
+                issue_type: IssueType::EdgeCaseNotTested,
+                description: "Test contains todo! indicating incomplete edge case testing".to_string(),
+                code_snippet: line.trim().to_string(),
+            });
         }
         
         // Check for tautological assert_eq!
