@@ -39,6 +39,47 @@ use quick_xml::se::to_string as to_xml_string;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use std::sync::Mutex;
+use thiserror::Error;
+
+/// Custom error types for the test auditor
+#[derive(Error, Debug)]
+pub enum AuditorError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("Path validation failed: {message}")]
+    PathValidation { message: String },
+    
+    #[error("Configuration error: {0}")]
+    Config(#[from] toml::de::Error),
+    
+    #[error("Regex compilation error: {0}")]
+    Regex(#[from] regex::Error),
+    
+    #[error("File too large: {path} ({size} bytes, max {max_size} bytes)")]
+    FileTooLarge { path: String, size: u64, max_size: u64 },
+    
+    #[error("Canonicalization failed for path '{path}': {source}")]
+    Canonicalization { path: String, source: std::io::Error },
+    
+    #[error("Path traversal detected: '{path}' is outside root '{root}'")]
+    PathTraversal { path: String, root: String },
+    
+    #[error("Parallel processing error: {message}")]
+    ParallelProcessing { message: String },
+    
+    #[error("JSON serialization error: {0}")]
+    JsonSerialization(#[from] serde_json::Error),
+    
+    #[error("XML serialization error: {0}")]
+    XmlSerialization(#[from] quick_xml::DeError),
+    
+    #[error("Invalid configuration: {message}")]
+    InvalidConfig { message: String },
+}
+
+/// Result type alias for auditor operations
+pub type AuditorResult<T> = Result<T, AuditorError>;
 
 /// Represents a single issue found during test auditing
 #[derive(Debug, Clone, Serialize)]
@@ -384,7 +425,7 @@ struct TestAuditor {
 
 impl TestAuditor {
     /// Creates a new TestAuditor with default configuration
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    fn new() -> AuditorResult<Self> {
         Self::with_config(Config::default(), PathBuf::from("."))
     }
 
@@ -393,9 +434,12 @@ impl TestAuditor {
     /// # Arguments
     /// * `config` - Configuration settings for the auditor
     /// * `root_path` - Root directory for path validation (prevents path traversal)
-    fn with_config(config: Config, root_path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    fn with_config(config: Config, root_path: PathBuf) -> AuditorResult<Self> {
         let canonical_root = root_path.canonicalize()
-            .map_err(|e| format!("Failed to canonicalize root path: {}", e))?;
+            .map_err(|e| AuditorError::Canonicalization {
+                path: root_path.display().to_string(),
+                source: e,
+            })?;
 
         Ok(TestAuditor {
             issues: Vec::new(),
@@ -542,13 +586,18 @@ impl TestAuditor {
     /// 
     /// This prevents path traversal attacks by ensuring files are only read
     /// from within the specified root directory.
-    fn validate_path(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_path(&self, path: &Path) -> AuditorResult<()> {
         let canonical_path = path.canonicalize()
-            .map_err(|e| format!("Failed to canonicalize path {}: {}", path.display(), e))?;
+            .map_err(|e| AuditorError::Canonicalization {
+                path: path.display().to_string(),
+                source: e,
+            })?;
         
         if !canonical_path.starts_with(&self.root_path) {
-            return Err(format!("Path traversal detected: {} is outside {}", 
-                canonical_path.display(), self.root_path.display()).into());
+            return Err(AuditorError::PathTraversal {
+                path: canonical_path.display().to_string(),
+                root: self.root_path.display().to_string(),
+            });
         }
         
         Ok(())
@@ -561,7 +610,7 @@ impl TestAuditor {
     /// 
     /// # Returns
     /// Result indicating success or failure of the audit operation
-    fn audit_file(&mut self, file_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fn audit_file(&mut self, file_path: &Path) -> AuditorResult<()> {
         // Validate path to prevent traversal attacks
         self.validate_path(file_path)?;
         
@@ -569,8 +618,11 @@ impl TestAuditor {
         let metadata = fs::metadata(file_path)?;
         const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB limit
         if metadata.len() > MAX_FILE_SIZE {
-            println!("Skipping large file: {} ({} bytes)", file_path.display(), metadata.len());
-            return Ok(());
+            return Err(AuditorError::FileTooLarge {
+                path: file_path.display().to_string(),
+                size: metadata.len(),
+                max_size: MAX_FILE_SIZE,
+            });
         }
         
         let content = fs::read_to_string(file_path)?;
@@ -863,7 +915,7 @@ impl TestAuditor {
         }
     }
 
-    fn audit_directory(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fn audit_directory(&mut self, path: &Path) -> AuditorResult<()> {
         let test_files = self.find_test_files(path);
         
         println!("Found {} test files", test_files.len());
@@ -923,7 +975,7 @@ impl TestAuditor {
         }
     }
     
-    fn audit_files_sequential(&mut self, test_files: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    fn audit_files_sequential(&mut self, test_files: Vec<PathBuf>) -> AuditorResult<()> {
         for file_path in test_files {
             println!("Auditing: {}", file_path.display());
             self.audit_file(&file_path)?;
@@ -931,7 +983,7 @@ impl TestAuditor {
         Ok(())
     }
     
-    fn audit_files_parallel(&mut self, test_files: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    fn audit_files_parallel(&mut self, test_files: Vec<PathBuf>) -> AuditorResult<()> {
         let shared_issues = Mutex::new(Vec::new());
         let shared_errors = Mutex::new(Vec::new());
         let config = self.config.clone();
@@ -975,7 +1027,9 @@ impl TestAuditor {
         // Check for errors
         let errors = shared_errors.into_inner().unwrap();
         if !errors.is_empty() {
-            return Err(format!("Parallel processing errors: {}", errors.join(", ")).into());
+            return Err(AuditorError::ParallelProcessing {
+                message: errors.join(", "),
+            });
         }
         
         // Collect all issues
@@ -985,9 +1039,12 @@ impl TestAuditor {
         Ok(())
     }
 
-    fn generate_report(&self) {
+    fn generate_report(&self) -> AuditorResult<()> {
         match self.config.output.format {
-            OutputFormat::Console => self.generate_console_report(),
+            OutputFormat::Console => {
+                self.generate_console_report();
+                Ok(())
+            },
             OutputFormat::Json => self.generate_json_report(),
             OutputFormat::Xml => self.generate_xml_report(),
         }
@@ -1045,7 +1102,7 @@ impl TestAuditor {
         println!("{}", status_message);
     }
 
-    fn generate_json_report(&self) {
+    fn generate_json_report(&self) -> AuditorResult<()> {
         #[derive(Serialize)]
         struct JsonReport {
             total_issues: usize,
@@ -1057,13 +1114,12 @@ impl TestAuditor {
             issues: self.issues.clone(),
         };
 
-        match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{}", json),
-            Err(e) => eprintln!("Error generating JSON report: {}", e),
-        }
+        let json = serde_json::to_string_pretty(&report)?;
+        println!("{}", json);
+        Ok(())
     }
 
-    fn generate_xml_report(&self) {
+    fn generate_xml_report(&self) -> AuditorResult<()> {
         #[derive(Serialize)]
         #[serde(rename = "test_audit_report")]
         struct XmlReport {
@@ -1076,14 +1132,14 @@ impl TestAuditor {
             issues: self.issues.clone(),
         };
 
-        match to_xml_string(&report) {
-            Ok(xml) => println!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml),
-            Err(e) => eprintln!("Error generating XML report: {}", e),
-        }
+        let xml = to_xml_string(&report)
+            .map_err(|e| AuditorError::XmlSerialization(e))?;
+        println!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml);
+        Ok(())
     }
 }
 
-fn load_config(config_path: Option<&str>) -> Result<Config, Box<dyn std::error::Error>> {
+fn load_config(config_path: Option<&str>) -> AuditorResult<Config> {
     let config_file = config_path.unwrap_or(".test-auditor");
     
     if Path::new(config_file).exists() {
@@ -1095,7 +1151,7 @@ fn load_config(config_path: Option<&str>) -> Result<Config, Box<dyn std::error::
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> AuditorResult<()> {
     let matches = Command::new("test-auditor")
         .version("1.0")
         .author("Your Name")
@@ -1166,7 +1222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut auditor = TestAuditor::with_config(config, PathBuf::from(path))?;
     auditor.audit_directory(Path::new(path))?;
-    auditor.generate_report();
+    auditor.generate_report()?;
 
     // Return proper exit code for CI without using std::process::exit
     if !auditor.issues.is_empty() {
@@ -1392,7 +1448,7 @@ mod tests {
     #[test]
     fn test_generate_report_no_issues() {
         let auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
-        auditor.generate_report();
+        auditor.generate_report().unwrap();
     }
 
     #[test]
@@ -1407,7 +1463,7 @@ mod tests {
             code_snippet: "assert!(true)".to_string(),
         });
         
-        auditor.generate_report();
+        auditor.generate_report().unwrap();
     }
 
     #[test]
@@ -1450,6 +1506,40 @@ mod tests {
         // Test unsafe unwrap patterns
         assert!(!auditor.is_safe_unwrap_context("let value = some_result.unwrap();"));
         assert!(!auditor.is_safe_unwrap_context("process_data().unwrap();"));
+    }
+    
+    #[test]
+    fn test_custom_error_types() {
+        // Test path traversal error
+        let auditor = TestAuditor::with_config(Config::default(), PathBuf::from("/tmp")).unwrap();
+        let result = auditor.validate_path(Path::new("/etc/passwd"));
+        assert!(result.is_err());
+        
+        let error = result.unwrap_err();
+        match error {
+            AuditorError::PathTraversal { path, root } => {
+                assert!(path.contains("/etc/passwd"));
+                assert!(root.contains("/tmp"));
+            }
+            _ => panic!("Expected PathTraversal error, got: {:?}", error),
+        }
+        
+        // Test config error
+        let invalid_toml = "[invalid toml content";
+        let config_result: Result<Config, _> = toml::from_str(invalid_toml);
+        assert!(config_result.is_err());
+        
+        // Test file too large error (simulated)
+        let large_file_error = AuditorError::FileTooLarge {
+            path: "large_file.rs".to_string(),
+            size: 20_000_000,
+            max_size: 10_000_000,
+        };
+        
+        let error_message = large_file_error.to_string();
+        assert!(error_message.contains("File too large"));
+        assert!(error_message.contains("large_file.rs"));
+        assert!(error_message.contains("20000000 bytes"));
     }
 
     #[test]
