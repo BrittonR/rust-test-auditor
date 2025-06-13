@@ -37,6 +37,8 @@ use colored::*;
 use serde::{Deserialize, Serialize};
 use quick_xml::se::to_string as to_xml_string;
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use std::sync::Mutex;
 
 /// Represents a single issue found during test auditing
 #[derive(Debug, Clone, Serialize)]
@@ -54,7 +56,7 @@ struct TestIssue {
 }
 
 /// Configuration structure for the test auditor
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
     /// Configuration for which rules to enable/disable
     #[serde(default)]
@@ -62,12 +64,12 @@ struct Config {
     /// Configuration for output formatting
     #[serde(default)]
     output: OutputConfig,
-    /// Configuration for pattern matching (currently unused)
+    /// Configuration for pattern matching and file exclusions
     #[serde(default)]
     patterns: PatternConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct RuleConfig {
     #[serde(default = "default_true")]
     hardcoded_values: bool,
@@ -105,9 +107,13 @@ struct RuleConfig {
     sleep_in_test: bool,
     #[serde(default = "default_true")]
     todo_in_test: bool,
+    #[serde(default = "default_true")]
+    test_timeout: bool,
+    #[serde(default = "default_true")]
+    flaky_test: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct OutputConfig {
     #[serde(default)]
     format: OutputFormat,
@@ -115,7 +121,7 @@ struct OutputConfig {
     color: bool,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 enum OutputFormat {
     #[default]
     Console,
@@ -123,12 +129,16 @@ enum OutputFormat {
     Xml,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct PatternConfig {
     #[serde(default = "default_magic_number_threshold")]
     magic_number_threshold: u32,
     #[serde(default)]
     ignore_patterns: Vec<String>,
+    #[serde(default)]
+    exclude_dirs: Vec<String>,
+    #[serde(default)]
+    exclude_files: Vec<String>,
 }
 
 fn default_true() -> bool { true }
@@ -155,6 +165,8 @@ impl Default for RuleConfig {
             commented_out_code: true,
             sleep_in_test: true,
             todo_in_test: true,
+            test_timeout: true,
+            flaky_test: true,
         }
     }
 }
@@ -173,6 +185,16 @@ impl Default for PatternConfig {
         Self {
             magic_number_threshold: 10,
             ignore_patterns: Vec::new(),
+            exclude_dirs: vec![
+                "target".to_string(),
+                "node_modules".to_string(),
+                ".git".to_string(),
+                "vendor".to_string(),
+            ],
+            exclude_files: vec![
+                "*_generated.rs".to_string(),
+                "*.pb.rs".to_string(),
+            ],
         }
     }
 }
@@ -208,6 +230,8 @@ enum IssueType {
     CommentedOutCode,
     SleepInTest,
     TodoInTest,
+    TestTimeout,
+    FlakyTest,
 }
 
 impl IssueType {
@@ -231,6 +255,8 @@ impl IssueType {
             IssueType::CommentedOutCode => "yellow",
             IssueType::SleepInTest => "red",
             IssueType::TodoInTest => "yellow",
+            IssueType::TestTimeout => "red",
+            IssueType::FlakyTest => "red",
         }
     }
 
@@ -254,6 +280,8 @@ impl IssueType {
             IssueType::CommentedOutCode => "Commented-out test code",
             IssueType::SleepInTest => "Sleep/timing dependency in test",
             IssueType::TodoInTest => "TODO comments in test indicating incomplete work",
+            IssueType::TestTimeout => "Test may hang or timeout (infinite loops, blocking calls)",
+            IssueType::FlakyTest => "Test may be flaky or non-deterministic",
         }
     }
 }
@@ -305,8 +333,10 @@ static ISSUE_PATTERNS: Lazy<Vec<(Regex, IssueType)>> = Lazy::new(|| {
         (Regex::new(r"assert_eq!\([^,]*,\s*\d{2,}\s*\)").unwrap(), IssueType::MagicNumbers),
         (Regex::new(r"assert!\([^)]*>\s*\d{2,}\s*\)").unwrap(), IssueType::MagicNumbers),
         
-        // Async test issues - detect #[test] followed by async fn
+        // Async test issues - detect improper async test patterns
         (Regex::new(r"#\[test\]\s*\n\s*async\s+fn").unwrap(), IssueType::AsyncTestIssue),
+        (Regex::new(r"#\[tokio::test\]\s*\n\s*fn\s+\w+").unwrap(), IssueType::AsyncTestIssue),
+        (Regex::new(r"#\[async_std::test\]\s*\n\s*fn\s+\w+").unwrap(), IssueType::AsyncTestIssue),
         
         // Debug output left in tests
         (Regex::new(r"println!\(").unwrap(), IssueType::DebugOutput),
@@ -326,6 +356,22 @@ static ISSUE_PATTERNS: Lazy<Vec<(Regex, IssueType)>> = Lazy::new(|| {
         (Regex::new(r"//\s*TODO").unwrap(), IssueType::TodoInTest),
         (Regex::new(r"//\s*FIXME").unwrap(), IssueType::TodoInTest),
         (Regex::new(r"//\s*XXX").unwrap(), IssueType::TodoInTest),
+        
+        // Test timeout patterns (potential hanging tests)
+        (Regex::new(r"loop\s*\{").unwrap(), IssueType::TestTimeout),
+        (Regex::new(r"while\s+true").unwrap(), IssueType::TestTimeout),
+        (Regex::new(r"std::io::stdin\(\)").unwrap(), IssueType::TestTimeout),
+        (Regex::new(r"stdin\(\)\.read_line").unwrap(), IssueType::TestTimeout),
+        (Regex::new(r"Channel::recv\(\)").unwrap(), IssueType::TestTimeout),
+        (Regex::new(r"\.recv\(\)").unwrap(), IssueType::TestTimeout),
+        
+        // Flaky test patterns
+        (Regex::new(r"retry").unwrap(), IssueType::FlakyTest),
+        (Regex::new(r"eventually").unwrap(), IssueType::FlakyTest),
+        (Regex::new(r"attempt").unwrap(), IssueType::FlakyTest),
+        (Regex::new(r"#\[ignore\]").unwrap(), IssueType::FlakyTest),
+        (Regex::new(r"// flaky").unwrap(), IssueType::FlakyTest),
+        (Regex::new(r"// unstable").unwrap(), IssueType::FlakyTest),
     ]
 });
 
@@ -378,6 +424,8 @@ impl TestAuditor {
             IssueType::CommentedOutCode => self.config.rules.commented_out_code,
             IssueType::SleepInTest => self.config.rules.sleep_in_test,
             IssueType::TodoInTest => self.config.rules.todo_in_test,
+            IssueType::TestTimeout => self.config.rules.test_timeout,
+            IssueType::FlakyTest => self.config.rules.flaky_test,
         }
     }
 
@@ -417,11 +465,42 @@ impl TestAuditor {
             if !name.ends_with(".rs") {
                 return false;
             }
+            
             let path_str = path.to_str().unwrap_or("");
-            // Exclude target directory and hidden directories, but not temp directories
-            if path_str.contains("target/") || (path_str.contains("/.") && !path_str.contains("/tmp")) {
+            
+            // Check exclude directories from config
+            for exclude_dir in &self.config.patterns.exclude_dirs {
+                if path_str.contains(&format!("/{}/", exclude_dir)) || 
+                   path_str.contains(&format!("{}/", exclude_dir)) {
+                    return false;
+                }
+            }
+            
+            // Check exclude files from config
+            for exclude_file in &self.config.patterns.exclude_files {
+                if exclude_file.contains('*') {
+                    // Simple glob matching for patterns like *.pb.rs
+                    let pattern = exclude_file.replace('*', "");
+                    if name.contains(&pattern) {
+                        return false;
+                    }
+                } else if name == exclude_file {
+                    return false;
+                }
+            }
+            
+            // Check general ignore patterns from config
+            for pattern in &self.config.patterns.ignore_patterns {
+                if path_str.contains(pattern) || name.contains(pattern) {
+                    return false;
+                }
+            }
+            
+            // Exclude hidden directories (but not temp directories)
+            if path_str.contains("/.") && !path_str.contains("/tmp") {
                 return false;
             }
+            
             return name.contains("test") || name.ends_with("_test.rs") || name == "tests.rs";
         }
         false
@@ -434,6 +513,21 @@ impl TestAuditor {
             .follow_links(true)
             .into_iter()
             .filter_map(|e| e.ok())
+            .filter(|e| {
+                // Pre-filter directories to avoid walking into excluded dirs
+                if e.path().is_dir() {
+                    let dir_name = e.path().file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    
+                    for exclude_dir in &self.config.patterns.exclude_dirs {
+                        if dir_name == exclude_dir {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
         {
             let path = entry.path();
             if path.is_file() && self.is_test_file(path) {
@@ -490,6 +584,7 @@ impl TestAuditor {
         self.check_for_misleading_names(file_path, &lines);
         self.check_for_no_assertions(file_path, &lines);
         self.check_async_tests(file_path, &lines);
+        self.check_flaky_test_patterns(file_path, &lines);
 
         Ok(())
     }
@@ -705,64 +800,64 @@ impl TestAuditor {
             return;
         }
 
-        let mut in_async_test = false;
-        let mut test_start_line = 0;
-        let mut test_body = String::new();
-        let mut brace_count = 0;
-        let mut seen_opening_brace = false;
-
         for (line_number, line) in lines.iter().enumerate() {
-            if line.contains("#[test]") && lines.get(line_number + 1).map_or(false, |next_line| next_line.contains("async fn")) {
-                in_async_test = true;
-                test_start_line = line_number + 1;
-                test_body.clear();
-                brace_count = 0;
-                seen_opening_brace = false;
-            } else if in_async_test {
-                // Count braces
-                for ch in line.chars() {
-                    if ch == '{' {
-                        brace_count += 1;
-                        seen_opening_brace = true;
-                    } else if ch == '}' {
-                        brace_count -= 1;
+            // Check for #[test] followed by async fn (incorrect pattern)
+            if line.contains("#[test]") {
+                if let Some(next_line) = lines.get(line_number + 1) {
+                    if next_line.contains("async fn") {
+                        self.issues.push(TestIssue {
+                            file_path: file_path.to_path_buf(),
+                            line_number: line_number + 1,
+                            issue_type: IssueType::AsyncTestIssue,
+                            description: "Invalid async test: use #[tokio::test] or #[async_std::test] instead of #[test] for async functions".to_string(),
+                            code_snippet: format!("{} {}", line.trim(), next_line.trim()),
+                        });
+                    }
+                }
+            }
+            
+            // Check for #[tokio::test] followed by non-async fn (warning)
+            if line.contains("#[tokio::test]") || line.contains("#[async_std::test]") {
+                if let Some(next_line) = lines.get(line_number + 1) {
+                    if next_line.contains("fn ") && !next_line.contains("async fn") {
+                        self.issues.push(TestIssue {
+                            file_path: file_path.to_path_buf(),
+                            line_number: line_number + 1,
+                            issue_type: IssueType::AsyncTestIssue,
+                            description: "Async test attribute on non-async function".to_string(),
+                            code_snippet: format!("{} {}", line.trim(), next_line.trim()),
+                        });
+                    }
+                }
+            }
+            
+            // Check for async functions with missing async test attributes
+            if line.contains("async fn test_") || (line.contains("async fn") && line.contains("test")) {
+                // Look for test attributes in the previous lines
+                let mut has_async_attr = false;
+                let mut has_regular_test = false;
+                
+                for i in 1..=3 {
+                    if let Some(prev_line) = lines.get(line_number.saturating_sub(i)) {
+                        if prev_line.contains("#[tokio::test]") || prev_line.contains("#[async_std::test]") {
+                            has_async_attr = true;
+                            break;
+                        }
+                        if prev_line.contains("#[test]") {
+                            has_regular_test = true;
+                            break;
+                        }
                     }
                 }
                 
-                // Add to test body if we've seen the opening brace
-                if seen_opening_brace {
-                    test_body.push_str(line);
-                    test_body.push('\n');
-                }
-                
-                // Check if we've closed all braces (end of test)
-                if brace_count == 0 && seen_opening_brace {
-                    // Check for common async test issues
-                    if !test_body.contains(".await") && !test_body.contains("block_on") && !test_body.contains("Runtime::new") {
-                        self.issues.push(TestIssue {
-                            file_path: file_path.to_path_buf(),
-                            line_number: test_start_line,
-                            issue_type: IssueType::AsyncTestIssue,
-                            description: "Async test function without .await, block_on, or runtime setup".to_string(),
-                            code_snippet: "async fn without async operations".to_string(),
-                        });
-                    }
-                    
-                    // Check for missing tokio::test or async-std::test attributes
-                    let prev_lines = &lines[test_start_line.saturating_sub(3)..test_start_line];
-                    let has_async_test_attr = prev_lines.iter().any(|l| l.contains("tokio::test") || l.contains("async_std::test"));
-                    
-                    if !has_async_test_attr && test_body.contains(".await") {
-                        self.issues.push(TestIssue {
-                            file_path: file_path.to_path_buf(),
-                            line_number: test_start_line,
-                            issue_type: IssueType::AsyncTestIssue,
-                            description: "Async test with .await but missing #[tokio::test] or #[async_std::test]".to_string(),
-                            code_snippet: "async test without proper test attribute".to_string(),
-                        });
-                    }
-                    
-                    in_async_test = false;
+                if !has_async_attr && !has_regular_test {
+                    self.issues.push(TestIssue {
+                        file_path: file_path.to_path_buf(),
+                        line_number: line_number + 1,
+                        issue_type: IssueType::AsyncTestIssue,
+                        description: "Async test function missing test attribute".to_string(),
+                        code_snippet: line.trim().to_string(),
+                    });
                 }
             }
         }
@@ -773,11 +868,120 @@ impl TestAuditor {
         
         println!("Found {} test files", test_files.len());
         
+        if test_files.len() > 5 {
+            // Use parallel processing for larger codebases
+            self.audit_files_parallel(test_files)
+        } else {
+            // Use sequential processing for small codebases to avoid overhead
+            self.audit_files_sequential(test_files)
+        }
+    }
+    
+    fn check_flaky_test_patterns(&mut self, file_path: &Path, lines: &[&str]) {
+        if !self.is_rule_enabled(&IssueType::FlakyTest) {
+            return;
+        }
+        
+        // Look for patterns that suggest flaky tests
+        for (line_number, line) in lines.iter().enumerate() {
+            let line_lower = line.to_lowercase();
+            
+            // Check for retry/timing patterns
+            if line_lower.contains("retry") && line_lower.contains("test") {
+                self.issues.push(TestIssue {
+                    file_path: file_path.to_path_buf(),
+                    line_number: line_number + 1,
+                    issue_type: IssueType::FlakyTest,
+                    description: "Test appears to use retry logic which may indicate flakiness".to_string(),
+                    code_snippet: line.trim().to_string(),
+                });
+            }
+            
+            // Check for multiple attempts or polling
+            if (line_lower.contains("for") && line_lower.contains("attempt")) ||
+               (line_lower.contains("while") && line_lower.contains("!ready")) {
+                self.issues.push(TestIssue {
+                    file_path: file_path.to_path_buf(),
+                    line_number: line_number + 1,
+                    issue_type: IssueType::FlakyTest,
+                    description: "Test uses polling or multiple attempts which may be flaky".to_string(),
+                    code_snippet: line.trim().to_string(),
+                });
+            }
+            
+            // Check for timing-dependent assertions
+            if line_lower.contains("assert") && 
+               (line_lower.contains("duration") || line_lower.contains("elapsed")) {
+                self.issues.push(TestIssue {
+                    file_path: file_path.to_path_buf(),
+                    line_number: line_number + 1,
+                    issue_type: IssueType::FlakyTest,
+                    description: "Test assertions depend on timing which may be unreliable".to_string(),
+                    code_snippet: line.trim().to_string(),
+                });
+            }
+        }
+    }
+    
+    fn audit_files_sequential(&mut self, test_files: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
         for file_path in test_files {
             println!("Auditing: {}", file_path.display());
             self.audit_file(&file_path)?;
         }
-
+        Ok(())
+    }
+    
+    fn audit_files_parallel(&mut self, test_files: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+        let shared_issues = Mutex::new(Vec::new());
+        let shared_errors = Mutex::new(Vec::new());
+        let config = self.config.clone();
+        let root_path = self.root_path.clone();
+        
+        // Process files in parallel
+        test_files
+            .par_iter()
+            .for_each(|file_path| {
+                println!("Auditing: {}", file_path.display());
+                
+                // Create a temporary auditor for this thread
+                let temp_auditor_result = TestAuditor::with_config(
+                    config.clone(),
+                    root_path.clone()
+                );
+                
+                let mut temp_auditor = match temp_auditor_result {
+                    Ok(auditor) => auditor,
+                    Err(e) => {
+                        let mut errors = shared_errors.lock().unwrap();
+                        errors.push(format!("Failed to create auditor: {}", e));
+                        return;
+                    }
+                };
+                
+                // Audit the file
+                if let Err(e) = temp_auditor.audit_file(file_path) {
+                    let mut errors = shared_errors.lock().unwrap();
+                    errors.push(format!("Failed to audit {}: {}", file_path.display(), e));
+                    return;
+                }
+                
+                // Merge results back
+                {
+                    let mut shared = shared_issues.lock().unwrap();
+                    shared.extend(temp_auditor.issues);
+                }
+            });
+        
+        // Check for errors
+        let errors = shared_errors.into_inner().unwrap();
+        if !errors.is_empty() {
+            return Err(format!("Parallel processing errors: {}", errors.join(", ")).into());
+        }
+        
+        // Collect all issues
+        let all_issues = shared_issues.into_inner().unwrap();
+        self.issues.extend(all_issues);
+        
         Ok(())
     }
 
