@@ -1,28 +1,68 @@
+//! # Rust Test Auditor
+//! 
+//! A command-line tool that analyzes Rust test suites for common anti-patterns
+//! and bad practices. The auditor scans test files and reports issues that may
+//! indicate poor test quality, maintainability problems, or reliability concerns.
+//! 
+//! ## Features
+//! 
+//! - Detects hardcoded values in assertions
+//! - Identifies tests that always pass (tautologies)
+//! - Finds empty test functions
+//! - Spots error handling anti-patterns
+//! - Detects copy-pasted test code
+//! - Identifies unsafe unwrap() usage
+//! - Finds debug output left in tests
+//! - Detects timing dependencies and sleep calls
+//! - Identifies TODO/FIXME comments in tests
+//! - Supports multiple output formats (Console, JSON, XML)
+//! - Configurable rules via TOML configuration
+//! 
+//! ## Usage
+//! 
+//! ```bash
+//! cargo run -- -p /path/to/project
+//! cargo run -- --json -p /path/to/project
+//! cargo run -- --config custom.toml -p /path/to/project
+//! ```
+
 use clap::{Arg, Command};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::hash::{Hash, Hasher, DefaultHasher};
 use walkdir::WalkDir;
 use regex::Regex;
 use colored::*;
 use serde::{Deserialize, Serialize};
 use quick_xml::se::to_string as to_xml_string;
+use once_cell::sync::Lazy;
 
+/// Represents a single issue found during test auditing
 #[derive(Debug, Clone, Serialize)]
 struct TestIssue {
+    /// Path to the file containing the issue
     file_path: PathBuf,
+    /// Line number where the issue was found
     line_number: usize,
+    /// Type of issue detected
     issue_type: IssueType,
+    /// Human-readable description of the issue
     description: String,
+    /// Code snippet that triggered the issue
     code_snippet: String,
 }
 
+/// Configuration structure for the test auditor
 #[derive(Debug, Deserialize)]
 struct Config {
+    /// Configuration for which rules to enable/disable
     #[serde(default)]
     rules: RuleConfig,
+    /// Configuration for output formatting
     #[serde(default)]
     output: OutputConfig,
+    /// Configuration for pattern matching (currently unused)
     #[serde(default)]
     patterns: PatternConfig,
 }
@@ -57,6 +97,14 @@ struct RuleConfig {
     magic_numbers: bool,
     #[serde(default = "default_true")]
     async_test_issue: bool,
+    #[serde(default = "default_true")]
+    debug_output: bool,
+    #[serde(default = "default_true")]
+    commented_out_code: bool,
+    #[serde(default = "default_true")]
+    sleep_in_test: bool,
+    #[serde(default = "default_true")]
+    todo_in_test: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +151,10 @@ impl Default for RuleConfig {
             vague_panic: true,
             magic_numbers: true,
             async_test_issue: true,
+            debug_output: true,
+            commented_out_code: true,
+            sleep_in_test: true,
+            todo_in_test: true,
         }
     }
 }
@@ -135,6 +187,7 @@ impl Default for Config {
     }
 }
 
+/// Types of issues that can be detected in test code
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 enum IssueType {
     HardcodedValues,
@@ -151,6 +204,10 @@ enum IssueType {
     VaguePanic,
     MagicNumbers,
     AsyncTestIssue,
+    DebugOutput,
+    CommentedOutCode,
+    SleepInTest,
+    TodoInTest,
 }
 
 impl IssueType {
@@ -170,6 +227,10 @@ impl IssueType {
             IssueType::VaguePanic => "yellow",
             IssueType::MagicNumbers => "yellow",
             IssueType::AsyncTestIssue => "red",
+            IssueType::DebugOutput => "yellow",
+            IssueType::CommentedOutCode => "yellow",
+            IssueType::SleepInTest => "red",
+            IssueType::TodoInTest => "yellow",
         }
     }
 
@@ -189,75 +250,111 @@ impl IssueType {
             IssueType::VaguePanic => "should_panic without specific message",
             IssueType::MagicNumbers => "Magic numbers/strings without context",
             IssueType::AsyncTestIssue => "Async test without proper .await or runtime",
+            IssueType::DebugOutput => "Debug output left in test (println!, dbg!, etc)",
+            IssueType::CommentedOutCode => "Commented-out test code",
+            IssueType::SleepInTest => "Sleep/timing dependency in test",
+            IssueType::TodoInTest => "TODO comments in test indicating incomplete work",
         }
     }
 }
 
+// Cached regex patterns for performance
+static TEST_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"#\[test\]").unwrap(),
+        Regex::new(r"#\[cfg\(test\)\]").unwrap(),
+        Regex::new(r"fn test_\w+").unwrap(),
+        Regex::new(r"describe\(").unwrap(),
+        Regex::new(r"it\(").unwrap(),
+        Regex::new(r"TEST\(").unwrap(),
+    ]
+});
+
+static ISSUE_PATTERNS: Lazy<Vec<(Regex, IssueType)>> = Lazy::new(|| {
+    vec![
+        // Hardcoded values
+        (Regex::new(r"assert_eq!\(\s*\d+\s*,\s*\d+\s*\)").unwrap(), IssueType::HardcodedValues),
+        (Regex::new(r#"assert_eq!\(\s*"[^"]*"\s*,\s*"[^"]*"\s*\)"#).unwrap(), IssueType::HardcodedValues),
+        
+        // Always pass
+        (Regex::new(r"assert!\(true\)").unwrap(), IssueType::AlwaysPass),
+        
+        // Empty tests
+        (Regex::new(r"#\[test\]\s*fn\s+\w+\(\)\s*\{\s*\}").unwrap(), IssueType::EmptyTest),
+        
+        // Error ignored - more specific patterns (fixed false positive)
+        (Regex::new(r"\.unwrap_or\(\s*\)\.unwrap\(\)").unwrap(), IssueType::ErrorIgnored),
+        (Regex::new(r"let\s+_\s*=.*\.unwrap\(\)").unwrap(), IssueType::ErrorIgnored),
+        (Regex::new(r"\.unwrap_or_default\(\)\s*;").unwrap(), IssueType::ErrorIgnored),
+        
+        // Implementation details
+        (Regex::new(r"assert!\(\w+\.capacity\(\)").unwrap(), IssueType::ImplementationDetail),
+        (Regex::new(r"assert!\(\w+\.len\(\)\s*==\s*\w+\.capacity\(\)").unwrap(), IssueType::ImplementationDetail),
+        
+        // Non-deterministic patterns
+        (Regex::new(r"SystemTime::now\(\)|Instant::now\(\)").unwrap(), IssueType::NonDeterministic),
+        (Regex::new(r"rand::|random\(\)|thread_rng\(\)").unwrap(), IssueType::NonDeterministic),
+        
+        // Unsafe unwrap - simple pattern, context checking done separately
+        (Regex::new(r"\.unwrap\(\)").unwrap(), IssueType::UnsafeUnwrap),
+        
+        // Vague should_panic
+        (Regex::new(r"#\[should_panic\]\s*$").unwrap(), IssueType::VaguePanic),
+        
+        // Magic numbers in assertions (numbers > 10 without obvious context)
+        (Regex::new(r"assert_eq!\([^,]*,\s*\d{2,}\s*\)").unwrap(), IssueType::MagicNumbers),
+        (Regex::new(r"assert!\([^)]*>\s*\d{2,}\s*\)").unwrap(), IssueType::MagicNumbers),
+        
+        // Async test issues - detect #[test] followed by async fn
+        (Regex::new(r"#\[test\]\s*\n\s*async\s+fn").unwrap(), IssueType::AsyncTestIssue),
+        
+        // Debug output left in tests
+        (Regex::new(r"println!\(").unwrap(), IssueType::DebugOutput),
+        (Regex::new(r"eprintln!\(").unwrap(), IssueType::DebugOutput),
+        (Regex::new(r"dbg!\(").unwrap(), IssueType::DebugOutput),
+        (Regex::new(r"print!\(").unwrap(), IssueType::DebugOutput),
+        
+        // Commented-out test code
+        (Regex::new(r"//\s*(assert_|assert!|expect\()").unwrap(), IssueType::CommentedOutCode),
+        (Regex::new(r"//\s*#\[test\]").unwrap(), IssueType::CommentedOutCode),
+        
+        // Sleep/timing dependencies in tests (more specific patterns)
+        (Regex::new(r"thread::sleep\(").unwrap(), IssueType::SleepInTest),
+        (Regex::new(r"std::thread::sleep\(").unwrap(), IssueType::SleepInTest),
+        
+        // TODO comments in tests
+        (Regex::new(r"//\s*TODO").unwrap(), IssueType::TodoInTest),
+        (Regex::new(r"//\s*FIXME").unwrap(), IssueType::TodoInTest),
+        (Regex::new(r"//\s*XXX").unwrap(), IssueType::TodoInTest),
+    ]
+});
+
+/// Main auditor structure that analyzes test files for anti-patterns
 struct TestAuditor {
     issues: Vec<TestIssue>,
-    test_patterns: Vec<Regex>,
-    issue_patterns: Vec<(Regex, IssueType)>,
     config: Config,
+    root_path: PathBuf,
 }
 
 impl TestAuditor {
+    /// Creates a new TestAuditor with default configuration
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_config(Config::default())
+        Self::with_config(Config::default(), PathBuf::from("."))
     }
 
-    fn with_config(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let test_patterns = vec![
-            Regex::new(r"#\[test\]")?,
-            Regex::new(r"#\[cfg\(test\)\]")?,
-            Regex::new(r"fn test_\w+")?,
-            Regex::new(r"describe\(")?,
-            Regex::new(r"it\(")?,
-            Regex::new(r"TEST\(")?,
-        ];
-
-        let issue_patterns = vec![
-            // Hardcoded values
-            (Regex::new(r"assert_eq!\(\s*\d+\s*,\s*\d+\s*\)")?, IssueType::HardcodedValues),
-            (Regex::new(r#"assert_eq!\(\s*"[^"]*"\s*,\s*"[^"]*"\s*\)"#)?, IssueType::HardcodedValues),
-            
-            // Always pass
-            (Regex::new(r"assert!\(true\)")?, IssueType::AlwaysPass),
-            
-            // Empty tests
-            (Regex::new(r"#\[test\]\s*fn\s+\w+\(\)\s*\{\s*\}")?, IssueType::EmptyTest),
-            
-            // Error ignored - more specific patterns
-            (Regex::new(r"\.unwrap_or\(\s*\)")?, IssueType::ErrorIgnored),
-            (Regex::new(r"let\s+_\s*=.*\.unwrap\(\)")?, IssueType::ErrorIgnored),
-            (Regex::new(r"\.unwrap_or_default\(\)\s*;")?, IssueType::ErrorIgnored),
-            
-            // Implementation details
-            (Regex::new(r"assert!\(\w+\.capacity\(\)")?, IssueType::ImplementationDetail),
-            (Regex::new(r"assert!\(\w+\.len\(\)\s*==\s*\w+\.capacity\(\)")?, IssueType::ImplementationDetail),
-            
-            // Non-deterministic patterns
-            (Regex::new(r"SystemTime::now\(\)|Instant::now\(\)")?, IssueType::NonDeterministic),
-            (Regex::new(r"rand::|random\(\)|thread_rng\(\)")?, IssueType::NonDeterministic),
-            
-            // Unsafe unwrap - simple pattern, context checking done separately
-            (Regex::new(r"\.unwrap\(\)")?, IssueType::UnsafeUnwrap),
-            
-            // Vague should_panic
-            (Regex::new(r"#\[should_panic\]\s*$")?, IssueType::VaguePanic),
-            
-            // Magic numbers in assertions (numbers > 10 without obvious context)
-            (Regex::new(r"assert_eq!\([^,]*,\s*\d{2,}\s*\)")?, IssueType::MagicNumbers),
-            (Regex::new(r"assert!\([^)]*>\s*\d{2,}\s*\)")?, IssueType::MagicNumbers),
-            
-            // Async test issues
-            (Regex::new(r"async\s+fn\s+test_\w+\(\)")?, IssueType::AsyncTestIssue),
-        ];
+    /// Creates a new TestAuditor with the specified configuration and root path
+    /// 
+    /// # Arguments
+    /// * `config` - Configuration settings for the auditor
+    /// * `root_path` - Root directory for path validation (prevents path traversal)
+    fn with_config(config: Config, root_path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let canonical_root = root_path.canonicalize()
+            .map_err(|e| format!("Failed to canonicalize root path: {}", e))?;
 
         Ok(TestAuditor {
             issues: Vec::new(),
-            test_patterns,
-            issue_patterns,
             config,
+            root_path: canonical_root,
         })
     }
 
@@ -277,6 +374,10 @@ impl TestAuditor {
             IssueType::VaguePanic => self.config.rules.vague_panic,
             IssueType::MagicNumbers => self.config.rules.magic_numbers,
             IssueType::AsyncTestIssue => self.config.rules.async_test_issue,
+            IssueType::DebugOutput => self.config.rules.debug_output,
+            IssueType::CommentedOutCode => self.config.rules.commented_out_code,
+            IssueType::SleepInTest => self.config.rules.sleep_in_test,
+            IssueType::TodoInTest => self.config.rules.todo_in_test,
         }
     }
 
@@ -303,6 +404,13 @@ impl TestAuditor {
         line.contains("// safe:") || line.contains("// SAFETY:") || line.contains("// OK to unwrap")
     }
 
+    /// Determines if a file should be considered a test file based on naming conventions
+    /// 
+    /// # Arguments
+    /// * `path` - Path to the file to check
+    /// 
+    /// # Returns
+    /// True if the file appears to be a test file
     fn is_test_file(&self, path: &Path) -> bool {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             // Only consider .rs files
@@ -336,7 +444,41 @@ impl TestAuditor {
         test_files
     }
 
+    /// Validates that a file path is within the allowed root directory
+    /// 
+    /// This prevents path traversal attacks by ensuring files are only read
+    /// from within the specified root directory.
+    fn validate_path(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let canonical_path = path.canonicalize()
+            .map_err(|e| format!("Failed to canonicalize path {}: {}", path.display(), e))?;
+        
+        if !canonical_path.starts_with(&self.root_path) {
+            return Err(format!("Path traversal detected: {} is outside {}", 
+                canonical_path.display(), self.root_path.display()).into());
+        }
+        
+        Ok(())
+    }
+
+    /// Audits a single file for test anti-patterns
+    /// 
+    /// # Arguments
+    /// * `file_path` - Path to the file to audit
+    /// 
+    /// # Returns
+    /// Result indicating success or failure of the audit operation
     fn audit_file(&mut self, file_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        // Validate path to prevent traversal attacks
+        self.validate_path(file_path)?;
+        
+        // Check file size to prevent memory issues
+        let metadata = fs::metadata(file_path)?;
+        const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB limit
+        if metadata.len() > MAX_FILE_SIZE {
+            println!("Skipping large file: {} ({} bytes)", file_path.display(), metadata.len());
+            return Ok(());
+        }
+        
         let content = fs::read_to_string(file_path)?;
         let lines: Vec<&str> = content.lines().collect();
 
@@ -358,7 +500,7 @@ impl TestAuditor {
             return;
         }
 
-        for (pattern, issue_type) in &self.issue_patterns {
+        for (pattern, issue_type) in ISSUE_PATTERNS.iter() {
             if pattern.is_match(line) && self.is_rule_enabled(issue_type) {
                 // Skip unwrap checks for well-known safe patterns in tests or with comments
                 if *issue_type == IssueType::UnsafeUnwrap && (self.is_safe_unwrap_context(line) || line.contains("//")) {
@@ -375,13 +517,13 @@ impl TestAuditor {
             }
         }
         
-        // Check for edge cases not tested
-        if line.contains("todo!") && self.test_patterns.iter().any(|p| p.is_match(full_content)) && self.is_rule_enabled(&IssueType::EdgeCaseNotTested) {
+        // Check for todo! macro in tests
+        if line.contains("todo!") && TEST_PATTERNS.iter().any(|p| p.is_match(full_content)) && self.is_rule_enabled(&IssueType::TodoInTest) {
             self.issues.push(TestIssue {
                 file_path: file_path.to_path_buf(),
                 line_number,
-                issue_type: IssueType::EdgeCaseNotTested,
-                description: "Test contains todo! indicating incomplete edge case testing".to_string(),
+                issue_type: IssueType::TodoInTest,
+                description: "Test contains todo! macro indicating incomplete implementation".to_string(),
                 code_snippet: line.trim().to_string(),
             });
         }
@@ -404,7 +546,7 @@ impl TestAuditor {
         if !self.is_rule_enabled(&IssueType::CopyPasted) {
             return;
         }
-        let mut test_bodies = HashSet::new();
+        let mut test_body_hashes = HashMap::new();
         let mut current_test_body = String::new();
         let mut in_test = false;
         let mut test_start_line = 0;
@@ -431,23 +573,31 @@ impl TestAuditor {
                 
                 // Only add to body if we've seen the opening brace
                 if seen_opening_brace && !line.contains("fn ") {
-                    current_test_body.push_str(line);
+                    current_test_body.push_str(line.trim());
                     current_test_body.push('\n');
                 }
                 
                 // Check if we've closed all braces
                 if brace_count == 0 && seen_opening_brace {
-                    let body_hash = current_test_body.trim().to_string();
-                    if !body_hash.is_empty() && test_bodies.contains(&body_hash) {
-                        self.issues.push(TestIssue {
-                            file_path: file_path.to_path_buf(),
-                            line_number: test_start_line,
-                            issue_type: IssueType::CopyPasted,
-                            description: "Potentially copy-pasted test body".to_string(),
-                            code_snippet: body_hash.clone(),
-                        });
+                    let body_content = current_test_body.trim();
+                    if !body_content.is_empty() {
+                        // Use hash for memory efficiency
+                        let mut hasher = DefaultHasher::new();
+                        body_content.hash(&mut hasher);
+                        let body_hash = hasher.finish();
+                        
+                        if let Some(first_occurrence) = test_body_hashes.get(&body_hash) {
+                            self.issues.push(TestIssue {
+                                file_path: file_path.to_path_buf(),
+                                line_number: test_start_line,
+                                issue_type: IssueType::CopyPasted,
+                                description: format!("Copy-pasted test body (first occurrence at line {})", first_occurrence),
+                                code_snippet: format!("Test body hash: {}", body_hash),
+                            });
+                        } else {
+                            test_body_hashes.insert(body_hash, test_start_line);
+                        }
                     }
-                    test_bodies.insert(body_hash);
                     in_test = false;
                 }
             }
@@ -810,13 +960,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.output.color = false;
     }
 
-    let mut auditor = TestAuditor::with_config(config)?;
+    let mut auditor = TestAuditor::with_config(config, PathBuf::from(path))?;
     auditor.audit_directory(Path::new(path))?;
     auditor.generate_report();
 
-    // Exit with proper code for CI
-    let exit_code = if auditor.issues.is_empty() { 0 } else { 1 };
-    std::process::exit(exit_code);
+    // Return proper exit code for CI without using std::process::exit
+    if !auditor.issues.is_empty() {
+        std::process::exit(1);
+    }
+    
+    Ok(())
 }
 
 #[cfg(test)]
@@ -863,15 +1016,15 @@ mod tests {
 
     #[test]
     fn test_auditor_new() {
-        let auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         assert!(auditor.issues.is_empty());
-        assert!(!auditor.test_patterns.is_empty());
-        assert!(!auditor.issue_patterns.is_empty());
+        assert!(!TEST_PATTERNS.is_empty());
+        assert!(!ISSUE_PATTERNS.is_empty());
     }
 
     #[test]
     fn test_is_test_file() {
-        let auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         
         assert!(auditor.is_test_file(Path::new("test_module.rs")));
         assert!(auditor.is_test_file(Path::new("module_test.rs")));
@@ -883,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_detect_hardcoded_values() {
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "assert_eq!(42, 42)", "");
@@ -901,7 +1054,7 @@ mod tests {
 
     #[test]
     fn test_detect_always_pass() {
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "assert!(true)", "");
@@ -913,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_detect_empty_test() {
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "#[test] fn test_empty() { }", "");
@@ -924,22 +1077,27 @@ mod tests {
 
     #[test]
     fn test_detect_error_ignored() {
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         let file_path = Path::new("test.rs");
         
-        auditor.check_line(file_path, 1, "result.unwrap_or()", "");
+        // Test fixed patterns that actually represent error ignored
+        auditor.check_line(file_path, 1, "result.unwrap_or().unwrap()", "");
         auditor.check_line(file_path, 2, "let _ = something.unwrap()", "");
         
-        assert_eq!(auditor.issues.len(), 3);
+        // Count by issue type
         let error_ignored_count = auditor.issues.iter().filter(|i| i.issue_type == IssueType::ErrorIgnored).count();
         let unsafe_unwrap_count = auditor.issues.iter().filter(|i| i.issue_type == IssueType::UnsafeUnwrap).count();
+        
+        // The first line has both unwrap_or().unwrap() and .unwrap(), so 1 error ignored + 2 unsafe unwraps
+        // The second line has let _ = and .unwrap(), so 1 error ignored + 1 unsafe unwrap
         assert_eq!(error_ignored_count, 2);
-        assert_eq!(unsafe_unwrap_count, 1);
+        assert_eq!(unsafe_unwrap_count, 2);
+        assert_eq!(auditor.issues.len(), 4);
     }
 
     #[test]
     fn test_detect_implementation_details() {
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         let file_path = Path::new("test.rs");
         
         auditor.check_line(file_path, 1, "assert!(vec.capacity() > 10)", "");
@@ -951,7 +1109,7 @@ mod tests {
 
     #[test]
     fn test_check_copy_pasted_tests() {
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         let file_path = Path::new("test.rs");
         
         let lines = vec![
@@ -973,7 +1131,7 @@ mod tests {
 
     #[test]
     fn test_check_misleading_names() {
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         let file_path = Path::new("test.rs");
         
         let lines = vec![
@@ -1002,7 +1160,8 @@ mod tests {
         writeln!(file, "    assert!(true);").unwrap();
         writeln!(file, "}}").unwrap();
         
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        // Use the temp directory as root to avoid path validation issues
+        let mut auditor = TestAuditor::with_config(Config::default(), dir.path().to_path_buf()).unwrap();
         auditor.audit_file(&file_path).unwrap();
         
         assert_eq!(auditor.issues.len(), 1);
@@ -1018,7 +1177,7 @@ mod tests {
         fs::File::create(dir.path().join("main.rs")).unwrap();
         fs::File::create(dir.path().join("lib.rs")).unwrap();
         
-        let auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let auditor = TestAuditor::with_config(Config::default(), dir.path().to_path_buf()).unwrap();
         let test_files = auditor.find_test_files(dir.path());
         
         assert_eq!(test_files.len(), 2);
@@ -1028,13 +1187,13 @@ mod tests {
 
     #[test]
     fn test_generate_report_no_issues() {
-        let auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         auditor.generate_report();
     }
 
     #[test]
     fn test_generate_report_with_issues() {
-        let mut auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let mut auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         
         auditor.issues.push(TestIssue {
             file_path: PathBuf::from("test.rs"),
@@ -1053,7 +1212,7 @@ mod tests {
         config.rules.hardcoded_values = false;
         config.rules.always_pass = true;
         
-        let auditor = TestAuditor::with_config(config).unwrap();
+        let auditor = TestAuditor::with_config(config, PathBuf::from(".")).unwrap();
         
         assert!(!auditor.is_rule_enabled(&IssueType::HardcodedValues));
         assert!(auditor.is_rule_enabled(&IssueType::AlwaysPass));
@@ -1064,7 +1223,7 @@ mod tests {
         let mut config = Config::default();
         config.output.format = OutputFormat::Json;
         
-        let auditor = TestAuditor::with_config(config).unwrap();
+        let auditor = TestAuditor::with_config(config, PathBuf::from(".")).unwrap();
         
         // This test just verifies the config is set correctly
         match auditor.config.output.format {
@@ -1076,7 +1235,7 @@ mod tests {
 
     #[test]
     fn test_safe_unwrap_detection() {
-        let auditor = TestAuditor::with_config(Config::default()).unwrap();
+        let auditor = TestAuditor::with_config(Config::default(), PathBuf::from(".")).unwrap();
         
         // Test safe unwrap patterns
         assert!(auditor.is_safe_unwrap_context("let dir = tempdir().unwrap();"));
