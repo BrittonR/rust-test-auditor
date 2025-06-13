@@ -39,6 +39,9 @@ pub enum IssueType {
     TodoInTest,
     TestTimeout,
     FlakyTest,
+    UnusedVariable,
+    UnreachableCode,
+    TautologicalAssertion,
 }
 
 impl IssueType {
@@ -64,6 +67,9 @@ impl IssueType {
             IssueType::TodoInTest => "yellow",
             IssueType::TestTimeout => "red",
             IssueType::FlakyTest => "red",
+            IssueType::UnusedVariable => "yellow",
+            IssueType::UnreachableCode => "red",
+            IssueType::TautologicalAssertion => "red",
         }
     }
 
@@ -89,6 +95,9 @@ impl IssueType {
             IssueType::TodoInTest => "TODO comments in test indicating incomplete work",
             IssueType::TestTimeout => "Test may hang or timeout (infinite loops, blocking calls)",
             IssueType::FlakyTest => "Test may be flaky or non-deterministic",
+            IssueType::UnusedVariable => "Variable declared but never used in test",
+            IssueType::UnreachableCode => "Unreachable code detected in test function",
+            IssueType::TautologicalAssertion => "Assertion that always evaluates to the same result",
         }
     }
 }

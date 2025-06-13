@@ -26,6 +26,7 @@
 //! cargo run -- --config custom.toml -p /path/to/project
 //! ```
 
+pub mod ast_analyzer;
 pub mod auditor;
 pub mod config;
 pub mod errors;
@@ -241,8 +242,14 @@ mod tests {
         let mut auditor = TestAuditor::with_config(Config::default(), dir.path().to_path_buf()).unwrap();
         auditor.audit_file(&file_path).unwrap();
         
-        assert_eq!(auditor.issues.len(), 1);
-        assert_eq!(auditor.issues[0].issue_type, IssueType::AlwaysPass);
+        // With AST analysis enabled, we may find more issues than just the regex-based ones
+        assert!(!auditor.issues.is_empty(), "Should find at least one issue");
+        
+        // Should still find the AlwaysPass issue from regex analysis
+        let always_pass_issues: Vec<_> = auditor.issues.iter()
+            .filter(|issue| issue.issue_type == IssueType::AlwaysPass)
+            .collect();
+        assert_eq!(always_pass_issues.len(), 1);
     }
 
     #[test]

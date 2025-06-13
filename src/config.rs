@@ -56,6 +56,12 @@ pub struct RuleConfig {
     pub test_timeout: bool,
     #[serde(default = "default_true")]
     pub flaky_test: bool,
+    #[serde(default = "default_true")]
+    pub unused_variable: bool,
+    #[serde(default = "default_true")]
+    pub unreachable_code: bool,
+    #[serde(default = "default_true")]
+    pub tautological_assertion: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -117,6 +123,9 @@ impl Default for RuleConfig {
             todo_in_test: true,
             test_timeout: true,
             flaky_test: true,
+            unused_variable: true,
+            unreachable_code: true,
+            tautological_assertion: true,
         }
     }
 }

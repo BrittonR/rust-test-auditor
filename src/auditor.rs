@@ -7,6 +7,7 @@ use regex::Regex;
 use rayon::prelude::*;
 use std::sync::Mutex;
 
+use crate::ast_analyzer::AstAnalyzer;
 use crate::config::Config;
 use crate::errors::{AuditorError, AuditorResult};
 use crate::issue::{TestIssue, IssueType};
@@ -66,6 +67,9 @@ impl TestAuditor {
             IssueType::TodoInTest => self.config.rules.todo_in_test,
             IssueType::TestTimeout => self.config.rules.test_timeout,
             IssueType::FlakyTest => self.config.rules.flaky_test,
+            IssueType::UnusedVariable => self.config.rules.unused_variable,
+            IssueType::UnreachableCode => self.config.rules.unreachable_code,
+            IssueType::TautologicalAssertion => self.config.rules.tautological_assertion,
         }
     }
 
@@ -224,6 +228,7 @@ impl TestAuditor {
         let content = fs::read_to_string(file_path)?;
         let lines: Vec<&str> = content.lines().collect();
 
+        // Run regex-based analysis
         for (line_number, line) in lines.iter().enumerate() {
             self.check_line(file_path, line_number + 1, line, &content);
         }
@@ -234,6 +239,39 @@ impl TestAuditor {
         self.check_async_tests(file_path, &lines);
         self.check_flaky_test_patterns(file_path, &lines);
 
+        // Run AST-based analysis
+        self.run_ast_analysis(file_path, &content)?;
+
+        Ok(())
+    }
+
+    /// Runs AST-based analysis on the file content
+    /// 
+    /// # Arguments
+    /// * `file_path` - Path to the file being analyzed
+    /// * `content` - The file content as a string
+    /// 
+    /// # Returns
+    /// Result indicating success or failure of the AST analysis
+    fn run_ast_analysis(&mut self, file_path: &Path, content: &str) -> AuditorResult<()> {
+        let mut ast_analyzer = AstAnalyzer::new();
+        
+        match ast_analyzer.analyze_file(file_path, content) {
+            Ok(()) => {
+                // Filter AST issues based on enabled rules before adding them
+                for issue in ast_analyzer.issues {
+                    if self.is_rule_enabled(&issue.issue_type) {
+                        self.issues.push(issue);
+                    }
+                }
+            }
+            Err(syn_error) => {
+                // If AST parsing fails, log a warning but don't fail the entire audit
+                // This allows the regex-based analysis to still work on malformed code
+                eprintln!("Warning: AST analysis failed for {}: {}", file_path.display(), syn_error);
+            }
+        }
+        
         Ok(())
     }
 
